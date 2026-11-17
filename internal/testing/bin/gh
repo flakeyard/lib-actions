@@ -1,0 +1,381 @@
+#!/usr/bin/env bash
+# Stub of gh api, gh variable and gh secret for tests; not public API of the
+# library (ADR-0001).
+#
+# A GET is answered from the file that fixture_file of fixtures.sh names for
+# its path; with --paginate, FILE.2, FILE.3 and so on are further pages. A
+# missing file is HTTP 404, or an empty answer when MISSING_IS_EMPTY is set,
+# and a file that contains "HTTP 500" is a server error. Like gh, an error
+# prints its body on stdout and its message on stderr. With -i, the status line
+# and the empty line that ends the headers come first, for each page, also of an
+# error and also with --silent. While FILE.transient holds a count above zero,
+# each request takes one from it and fails with the kind of failure written
+# after the count. A GET is appended to $CALLS, as below, only when LOG_GETS is
+# set.
+#
+# A GraphQL request, "api graphql", is appended to $CALLS as "graphql" and its
+# fields other than query, and answered in the same way from the file of
+# "graphql?FIELDS"; a missing file is the GraphQL error NOT_FOUND, and a body
+# with "errors" fails as gh does.
+#
+# Other methods are appended to $CALLS as "METHOD PATH FIELDS" and succeed,
+# unless "METHOD PATH [STATUS]" is a line of $FAIL_ON, which fails with HTTP
+# STATUS, 502 by default; a GET in FAIL_ON fails too. The body of --input FILE,
+# or of stdin for "-", is one more field, "--input=" and the body as compact
+# JSON when it is exactly one JSON value, and its bytes as a JSON string
+# otherwise; a FILE that cannot be read fails as in gh. As in gh, the fields of
+# a request with --input are its query string instead, "PATH?NAME=VALUE&...",
+# here in the order given and not escaped. A GraphQL request takes no --input.
+# With --silent, no body is printed.
+#
+# "gh variable get NAME" prints the fixture of variable_fixture NAME, and fails
+# like gh without one; its flags --json, --jq and --template are not supported.
+# "gh variable set" and "gh secret set" succeed; they are appended to $CALLS as
+# their command line, and the get also when LOG_GETS is set. The value of a
+# secret on stdin, also of "--env-file -", is read and not recorded.
+# shellcheck source-path=SCRIPTDIR
+set -euo pipefail
+shopt -s inherit_errexit
+# shellcheck source=../fixtures.sh
+source "${BASH_SOURCE[0]%/*}/../fixtures.sh"
+
+readonly GRAPHQL=graphql
+# A line of FAIL_ON with a status: the call, a space and three digits.
+readonly FAIL_ON_STATUS_FORM='^(.*) ([0-9]{3})$'
+readonly DEFAULT_FAILURE_STATUS=502
+readonly OK_STATUS=200
+# A JSON string of text: the JSON value it holds when it is exactly one, and
+# the string otherwise.
+# shellcheck disable=SC2016 # jq, not expanded here
+readonly ONE_VALUE_OR_TEXT='. as $text | try fromjson catch $text'
+# The flags of gh variable and gh secret that take a value.
+readonly VALUE_FLAG_FORM='^(-o|--org|-R|--repo|-e|--env|-b|--body|-v|--visibility|-r|--repos|-a|--app|-f|--env-file)$'
+# The flags of gh variable get that format its output, alone or with their
+# value.
+readonly FORMAT_FLAG_FORM='^(--json|--jq|--template)(=.*)?$|^-[qt]'
+# The flag of gh secret set that names a file of secrets instead of stdin.
+readonly ENV_FILE_FLAG_FORM='^(-f|--env-file)$'
+
+# status_line STATUS MESSAGE: with -i, print the status line of the answer
+# and the end of its headers before it, like gh does.
+status_line() {
+  local status=$1 message=$2
+  if ${include}; then printf 'HTTP/2.0 %s %s\n\r\n' "${status}" "${message}" >&"${headers}"; fi
+}
+
+# page_break: with -i, separate a page from the headers of the next one, like
+# gh does.
+page_break() {
+  if ${include}; then printf '\n' >&"${headers}"; fi
+}
+
+# fail STATUS [MESSAGE]: fail like gh does on an HTTP error.
+fail() {
+  local status=$1 message=${2:-Error}
+  status_line "${status}" "${message}"
+  printf '{"message":"%s","status":"%s"}\n' "${message}" "${status}"
+  printf 'gh: %s (HTTP %s)\n' "${message}" "${status}" >&2
+  exit 1
+}
+
+# graphql_error TYPE MESSAGE: fail like gh does on a GraphQL error.
+graphql_error() {
+  local type=$1 message=$2
+  status_line "${OK_STATUS}" OK
+  printf '{"data":null,"errors":[{"type":"%s","message":"%s"}]}\n' "${type}" "${message}"
+  printf 'gh: %s\n' "${message}" >&2
+  exit 1
+}
+
+# failure_status METHOD PATH: print the HTTP status that FAIL_ON gives the
+# call; prints nothing when the call succeeds.
+failure_status() {
+  local call="$1 $2" line
+  while IFS= read -r line; do
+    if [[ ${line} == "${call}" ]]; then
+      echo "${DEFAULT_FAILURE_STATUS}"
+      return 0
+    elif [[ ${line} =~ ${FAIL_ON_STATUS_FORM} && ${BASH_REMATCH[1]} == "${call}" ]]; then
+      echo "${BASH_REMATCH[2]}"
+      return 0
+    fi
+  done <<<"${FAIL_ON:-}"
+}
+
+# graphql_errors FILE: fail like gh does on an answer with GraphQL errors.
+graphql_errors() {
+  local file=$1
+  status_line "${OK_STATUS}" OK
+  cat -- "${file}"
+  printf 'gh: GraphQL error\n' >&2
+  exit 1
+}
+
+# fail_transiently FILE: fail while the count of FILE.transient lasts.
+fail_transiently() {
+  local file=$1 count kind
+  [[ -f ${file}.transient ]] || return 0
+  read -r count kind <"${file}.transient"
+  ((count > 0)) || return 0
+  printf '%s %s\n' $((count - 1)) "${kind}" >"${file}.transient"
+  case ${kind} in
+    rate-limited) graphql_error RATE_LIMITED "API rate limit exceeded" ;;
+    *) fail 504 "Gateway Timeout" ;;
+  esac
+}
+
+# print_page FILE: print one page of an answer, through --jq when given.
+print_page() {
+  local file=$1
+  status_line "${OK_STATUS}" OK
+  if [[ -n ${jq_filter} ]]; then jq -r "${jq_filter}" "${file}"; else cat -- "${file}"; fi
+}
+
+# answer FILE: print FILE and, with --paginate, its further pages.
+answer() {
+  local file=$1 page=2
+  print_page "${file}"
+  while ${paginate} && [[ -f ${file}.${page} ]]; do
+    page_break
+    print_page "${file}.${page}"
+    page=$((page + 1))
+  done
+}
+
+# parse ARG...: the method, path, fields and flags of gh api ARG...
+parse() {
+  while (($#)); do
+    case $1 in
+      -X) method=$2 && shift ;;
+      --jq | -q) jq_filter=$2 && shift ;;
+      -f | -F) fields+=("$2") && shift ;;
+      --input) input=$2 && shift ;;
+      --paginate) paginate=true ;;
+      --silent) silent=true ;;
+      -i | --include) include=true ;;
+      -*) usage_error "unsupported flag $1" ;;
+      *) path=$1 ;;
+    esac
+    shift
+  done
+  [[ -n ${method} ]] || method=$(default_method)
+}
+
+# default_method: POST with fields or a body, as gh does, and GET without.
+default_method() {
+  if ((${#fields[@]})) || [[ -n ${input} ]]; then echo POST; else echo GET; fi
+}
+
+# open_failure: fail like gh does on a file of --input that cannot be read.
+open_failure() {
+  printf 'open %s: no such file or directory\n' "${input}" >&2
+  exit 1
+}
+
+# input_field: the body of --input as the field "--input=BODY".
+input_field() {
+  local text body
+  text=$(cat -- "${input}" 2>/dev/null | jq -Rs .) || open_failure
+  body=$(jq -c "${ONE_VALUE_OR_TEXT}" <<<"${text}")
+  printf -- '--input=%s\n' "${body}"
+}
+
+# query_path: the path with the fields as its query string.
+query_path() {
+  local separator='?' IFS='&'
+  [[ ${path} != *'?'* ]] || separator='&'
+  printf '%s%s%s\n' "${path}" "${separator}" "${fields[*]}"
+}
+
+# take_input: with --input, move the fields into the query string of the
+# path, as gh does, and record the body as the only field.
+take_input() {
+  [[ -n ${input} ]] || return 0
+  [[ ${path} != "${GRAPHQL}" ]] || usage_error "unsupported: graphql --input"
+  if ((${#fields[@]})); then path=$(query_path); fi
+  fields=("$(input_field)")
+}
+
+# record: append the request to $CALLS as "METHOD PATH FIELDS".
+record() {
+  printf '%s %s %s\n' "${method}" "${path}" "${fields[*]}" >>"${CALLS}"
+}
+
+# usage_error MESSAGE: exit as gh does on a wrong command line.
+usage_error() {
+  printf 'stub gh: %s\n' "$1" >&2
+  exit 2
+}
+
+# graphql_key: the name of the GraphQL request, from its fields.
+graphql_key() {
+  local field key=${GRAPHQL} separator='?'
+  for field in "${fields[@]}"; do
+    [[ ${field} != query=* ]] || continue
+    key+=${separator}${field} separator='&'
+  done
+  printf '%s\n' "${key}"
+}
+
+# graphql_fields: print the fields other than query, separated by spaces.
+graphql_fields() {
+  local key
+  key=$(graphql_key)
+  [[ ${key} == *'?'* ]] || return 0
+  key=${key#*'?'}
+  printf '%s\n' "${key//&/ }"
+}
+
+# graphql: answer a GraphQL request.
+graphql() {
+  local file key fields_text
+  fields_text=$(graphql_fields)
+  printf '%s %s\n' "${GRAPHQL}" "${fields_text}" >>"${CALLS}"
+  key=$(graphql_key)
+  file=$(fixture_file "${key}")
+  fail_transiently "${file}"
+  [[ -f ${file} ]] || graphql_error NOT_FOUND "Could not resolve to a node."
+  ! grep -q '"errors"' "${file}" || graphql_errors "${file}"
+  answer "${file}"
+}
+
+# fail_if_listed: fail the request if FAIL_ON lists it.
+fail_if_listed() {
+  local status
+  status=$(failure_status "${method}" "${path}")
+  [[ -z ${status} ]] || fail "${status}"
+}
+
+# change: record a request that changes something, and fail it if FAIL_ON
+# lists it.
+change() {
+  record
+  fail_if_listed
+}
+
+# missing: answer a GET without a fixture: empty when MISSING_IS_EMPTY is set,
+# and HTTP 404 otherwise.
+missing() {
+  [[ -n ${MISSING_IS_EMPTY-} ]] || fail 404 "Not Found"
+  status_line "${OK_STATUS}" OK
+  exit 0
+}
+
+# get: answer a GET.
+get() {
+  local file
+  if [[ -n ${LOG_GETS-} ]]; then record; fi
+  file=$(fixture_file "${path}")
+  fail_transiently "${file}"
+  fail_if_listed
+  [[ -f ${file} ]] || missing
+  ! grep -q 'HTTP 500' "${file}" || fail 500 "Server Error"
+  answer "${file}"
+}
+
+# api ARG...: answer gh api ARG...
+api() {
+  method="" path="" jq_filter="" paginate=false silent=false include=false input="" fields=()
+  parse "$@"
+  take_input
+  # Like gh, --silent prints no body, also of an error, but still the headers of
+  # -i; messages stay on stderr.
+  exec {headers}>&1
+  if ${silent}; then exec >/dev/null; fi
+  if [[ ${path} == "${GRAPHQL}" ]]; then
+    graphql
+  elif [[ ${method} != GET ]]; then
+    change
+  else
+    get
+  fi
+}
+
+# command_name ARG...: print the name that gh variable or gh secret ARG...
+# is about: the first argument that is neither a flag nor its value.
+command_name() {
+  while (($#)); do
+    if [[ $1 =~ ${VALUE_FLAG_FORM} ]]; then
+      shift
+    elif [[ $1 != -* ]]; then
+      printf '%s\n' "$1"
+      return 0
+    fi
+    shift
+  done
+  usage_error "no name"
+}
+
+# reject_format_flags ARG...: fail on the flags of gh variable get ARG... that
+# format its output.
+reject_format_flags() {
+  local arg
+  for arg; do
+    [[ ! ${arg} =~ ${FORMAT_FLAG_FORM} ]] || usage_error "unsupported flag ${arg}"
+  done
+}
+
+# variable_get ARG...: print the variable of gh variable get ARG..., or fail
+# like gh does without one.
+variable_get() {
+  local name key file
+  reject_format_flags "$@"
+  if [[ -n ${LOG_GETS-} ]]; then printf 'variable get %s\n' "$*" >>"${CALLS}"; fi
+  name=$(command_name "$@")
+  key=$(variable_key "${name}")
+  file=$(fixture_file "${key}")
+  [[ -f ${file} ]] || {
+    printf 'variable %s was not found\n' "${name}" >&2
+    exit 1
+  }
+  cat -- "${file}"
+}
+
+# variable ACTION ARG...: answer gh variable get or set.
+variable() {
+  local action=${1-}
+  shift || true
+  case ${action} in
+    get) variable_get "$@" ;;
+    set) printf 'variable set %s\n' "$*" >>"${CALLS}" ;;
+    *) usage_error "unsupported: variable ${action}" ;;
+  esac
+}
+
+# secret ACTION ARG...: answer gh secret set, which, like gh, reads the value
+# from stdin unless stdin is a terminal.
+secret() {
+  local action=${1-}
+  shift || true
+  [[ ${action} == set ]] || usage_error "unsupported: secret ${action}"
+  printf 'secret set %s\n' "$*" >>"${CALLS}"
+  drop_stdin_value "$@"
+}
+
+# drop_stdin_value ARG...: read and drop the value of gh secret set ARG...
+# when it comes from stdin and stdin is not a terminal: without -b or --body,
+# and without -f or --env-file or with "--env-file -", the first one given.
+drop_stdin_value() {
+  local arg file=-
+  for arg; do
+    [[ ${arg} != -b && ${arg} != --body && ${arg} != --body=* ]] || return 0
+  done
+  while (($#)); do
+    if [[ $1 =~ ${ENV_FILE_FLAG_FORM} ]]; then
+      file=${2-}
+      break
+    elif [[ $1 == --env-file=* ]]; then
+      file=${1#*=}
+      break
+    fi
+    shift
+  done
+  if [[ ${file} == - && ! -t 0 ]]; then cat >/dev/null; fi
+}
+
+command=${1-}
+shift || true
+case ${command} in
+  api | variable | secret) "${command}" "$@" ;;
+  *) usage_error "unsupported: ${command} $*" ;;
+esac
