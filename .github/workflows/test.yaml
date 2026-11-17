@@ -1,5 +1,6 @@
-# CI of this repository: workflow-check over the checks of the root flake;
-# the jobs that test the library come with its code.
+# CI of this repository: the action itself on the supported runners, where it
+# gives its directory, then workflow-check over all jobs; the unit tests come
+# with them.
 name: test
 
 on:
@@ -21,7 +22,28 @@ concurrency:
         && github.event.action != 'edited' }}
 
 jobs:
+  action:
+    name: Action
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: lib
+        uses: $/
+      - env:
+          LIB_PATH: ${{ steps.lib.outputs.path }}
+        run: tests/ci/action.sh
+
   check:
+    needs: [action]
     # Dispatched runs post their final status on every outcome.
     if: ${{ !cancelled() || github.event_name == 'workflow_dispatch' }}
     uses: flakeyard/workflow-check/.github/workflows/check.yaml@aa514199d5eb5231dfc42e70a99288fd79832311 # v0.4.0
