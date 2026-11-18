@@ -43,7 +43,7 @@
       url = "git+https://github.com/flakeyard/atom-workflows?ref=v0&rev=35e4a0994f92cc6c47b018fcf062aca59598c493&shallow=1";
       inputs.git-hooks.follows = "git-hooks";
     };
-    atom-workspace.url = "git+https://github.com/flakeyard/atom-workspace?ref=v0&rev=53d4d101ec71025dbb19da3d423455e72e10198a&shallow=1";
+    atom-workspace.url = "git+https://github.com/flakeyard/atom-workspace?ref=v0&rev=09ea8faaf078e30d9c918745ac40ce69a7b82946&shallow=1";
   };
 
   outputs =
