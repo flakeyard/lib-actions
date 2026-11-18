@@ -9,7 +9,7 @@ permissions: {}
 
 jobs:
   release:
-    uses: flakeyard/workflow-release/.github/workflows/release.yaml@3a9f231a7411b9c925069301f7aaaeef41e64d8e # v0.2.7
+    uses: flakeyard/workflow-release/.github/workflows/release.yaml@fe2ea19dbb35c14179cbcb2a5d6e33a91d2b1f10 # v0.2.9
     # Required by the called workflow for every path; with the App, its token
     # does the writes.
     permissions:
